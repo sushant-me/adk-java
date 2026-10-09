@@ -45,6 +45,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.genai.types.FunctionResponse;
+import com.google.genai.types.GenerateContentConfig;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.context.Context;
@@ -56,7 +57,9 @@ import io.reactivex.rxjava3.core.Single;
 import io.reactivex.rxjava3.disposables.Disposable;
 import io.reactivex.rxjava3.observers.DisposableCompletableObserver;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -124,15 +127,15 @@ public abstract class BaseLlmFlow implements BaseFlow {
   RequestProcessor getRequestProcessorFromTools(LlmAgent agent) {
     return (context, request) -> {
       ReadonlyContext readonlyContext = new ReadonlyContext(context);
+      // Filled as the tools run, so the collision check needs no second pass over the
+      // toolsets - that pass cost an extra tools/list request on every model call.
+      Set<String> declarationlessConfigNames = new HashSet<>();
       List<BiFunction<LlmRequest.Builder, ToolContext, Completable>> processors = new ArrayList<>();
 
       for (Object toolOrToolset : agent.toolsUnion()) {
         if (toolOrToolset instanceof BaseTool baseTool) {
           processors.add(
-              (builder, ctx) -> {
-                Completable c = baseTool.processLlmRequest(builder, ctx);
-                return c == null ? Completable.complete() : c;
-              });
+              (builder, ctx) -> applyTool(baseTool, builder, ctx, declarationlessConfigNames));
         } else if (toolOrToolset instanceof BaseToolset baseToolset) {
           // First apply the toolset's own request processor, then unwrap all tools from the toolset
           // and apply each individual tool's request processor sequentially.
@@ -143,10 +146,7 @@ public abstract class BaseLlmFlow implements BaseFlow {
                 return toolsetProcessor
                     .andThen(baseToolset.getTools(readonlyContext))
                     .concatMapCompletable(
-                        b -> {
-                          Completable tc = b.processLlmRequest(builder, ctx);
-                          return tc == null ? Completable.complete() : tc;
-                        });
+                        b -> applyTool(b, builder, ctx, declarationlessConfigNames));
               });
         } else {
           throw new IllegalArgumentException(
@@ -160,9 +160,52 @@ public abstract class BaseLlmFlow implements BaseFlow {
       return Flowable.fromIterable(processors)
           .concatMapCompletable(f -> f.apply(builder, toolContext))
           .andThen(
+              Completable.fromAction(
+                  () -> {
+                    Map<String, BaseTool> declared = builder.build().tools();
+                    for (String name : declarationlessConfigNames) {
+                      if (declared.containsKey(name)) {
+                        throw new IllegalArgumentException("Duplicate tool name: " + name);
+                      }
+                    }
+                  }))
+          .andThen(
               Single.fromCallable(
                   () -> RequestProcessingResult.create(builder.build(), ImmutableList.of())));
     };
+  }
+
+  /**
+   * Runs one tool's request processor, recording the tool's name when it adds an entry to the
+   * request's config tools without declaring a function.
+   *
+   * <p>Those are the in-model built-ins such as {@code google_search}: they never reach {@link
+   * LlmRequest#tools()}, so a function tool of the same name sits beside them and the model chooses
+   * between two things answering to one name. A declaration-less tool that adds no config entry,
+   * such as {@code ExampleTool}, is not one of them and is left alone.
+   */
+  private static Completable applyTool(
+      BaseTool tool,
+      LlmRequest.Builder builder,
+      ToolContext toolContext,
+      Set<String> declarationlessConfigNames) {
+    int before = configToolCount(builder);
+    Completable result = tool.processLlmRequest(builder, toolContext);
+    Completable nonNullResult = result == null ? Completable.complete() : result;
+    if (!tool.declaration().isEmpty()) {
+      return nonNullResult;
+    }
+    return nonNullResult.doOnComplete(
+        () -> {
+          if (configToolCount(builder) > before) {
+            declarationlessConfigNames.add(tool.name());
+          }
+        });
+  }
+
+  /** Number of tools currently set on the request's config. */
+  private static int configToolCount(LlmRequest.Builder builder) {
+    return builder.build().config().flatMap(GenerateContentConfig::tools).map(List::size).orElse(0);
   }
 
   /**

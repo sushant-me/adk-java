@@ -40,6 +40,7 @@ import com.google.adk.models.LlmResponse;
 import com.google.adk.testing.TestLlm;
 import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.BaseToolset;
+import com.google.adk.tools.GoogleSearchTool;
 import com.google.adk.tools.ToolContext;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -981,6 +982,111 @@ public final class BaseLlmFlowTest {
 
     assertThat(processedRequest.getSystemInstructions())
         .containsExactly("toolset-instruction\n\ntool-instruction");
+  }
+
+  @Test
+  public void getRequestProcessorFromTools_rejectsDeclarationlessNameCollision_inModelFirst() {
+    assertDeclarationlessCollisionRejected(/* declarationlessFirst= */ true);
+  }
+
+  @Test
+  public void getRequestProcessorFromTools_rejectsDeclarationlessNameCollision_functionToolFirst() {
+    assertDeclarationlessCollisionRejected(/* declarationlessFirst= */ false);
+  }
+
+  @Test
+  public void getRequestProcessorFromTools_allowsDeclarationlessToolAddingNoConfigEntry() {
+    // A declaration-less tool that adds nothing to the request's config tools is not a built-in
+    // answer, so it does not collide with a function tool of the same name. ExampleTool is the
+    // real-world case; a plain declaration-less BaseTool stands in for it here.
+    BaseTool declarationless = new BaseTool("lookup", "adds no config entry") {};
+
+    BaseTool functionTool =
+        new BaseTool("lookup", "function lookup") {
+          @Override
+          public Optional<FunctionDeclaration> declaration() {
+            return Optional.of(FunctionDeclaration.builder().name("lookup").build());
+          }
+        };
+
+    LlmAgent agent =
+        createTestAgentBuilder(createTestLlm(LlmResponse.builder().build()))
+            .tools(ImmutableList.of(declarationless, functionTool))
+            .build();
+
+    InvocationContext invocationContext = createInvocationContext(agent);
+    BaseLlmFlow baseLlmFlow = createBaseLlmFlowWithoutProcessors();
+    RequestProcessor requestProcessor = baseLlmFlow.getRequestProcessorFromTools(agent);
+
+    LlmRequest processedRequest =
+        requestProcessor
+            .processRequest(invocationContext, LlmRequest.builder().build())
+            .map(RequestProcessingResult::updatedRequest)
+            .blockingGet();
+
+    // The function tool is the only one that reaches the request's tools.
+    assertThat(processedRequest.tools()).containsKey("lookup");
+  }
+
+  private void assertDeclarationlessCollisionRejected(boolean declarationlessFirst) {
+    // A real in-model tool: it declares nothing, so it never enters the request's tool map.
+    // GoogleSearchTool.INSTANCE makes no network calls, so it is safe to use directly here.
+    BaseTool inModel = GoogleSearchTool.INSTANCE;
+
+    BaseTool functionTool =
+        new BaseTool("google_search", "function search") {
+          @Override
+          public Optional<FunctionDeclaration> declaration() {
+            return Optional.of(FunctionDeclaration.builder().name("google_search").build());
+          }
+        };
+
+    LlmAgent agent =
+        createTestAgentBuilder(createTestLlm(LlmResponse.builder().build()))
+            .tools(
+                declarationlessFirst
+                    ? ImmutableList.of(inModel, functionTool)
+                    : ImmutableList.of(functionTool, inModel))
+            .build();
+
+    InvocationContext invocationContext = createInvocationContext(agent);
+    BaseLlmFlow baseLlmFlow = createBaseLlmFlowWithoutProcessors();
+    RequestProcessor requestProcessor = baseLlmFlow.getRequestProcessorFromTools(agent);
+
+    IllegalArgumentException thrown =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                requestProcessor
+                    .processRequest(invocationContext, LlmRequest.builder().build())
+                    .blockingGet());
+    assertThat(thrown).hasMessageThat().isEqualTo("Duplicate tool name: google_search");
+  }
+
+  @Test
+  public void getRequestProcessorFromTools_allowsTwoDeclarationlessToolsSharingAName() {
+    // Both are declaration-less, so nothing is dispatched by name and no name is taken. Two
+    // default-named ExampleTools must keep working.
+    BaseTool first = new BaseTool("same_name", "first") {};
+    BaseTool second = new BaseTool("same_name", "second") {};
+
+    LlmAgent agent =
+        createTestAgentBuilder(createTestLlm(LlmResponse.builder().build()))
+            .tools(ImmutableList.of(first, second))
+            .build();
+
+    InvocationContext invocationContext = createInvocationContext(agent);
+    BaseLlmFlow baseLlmFlow = createBaseLlmFlowWithoutProcessors();
+    RequestProcessor requestProcessor = baseLlmFlow.getRequestProcessorFromTools(agent);
+
+    LlmRequest processedRequest =
+        requestProcessor
+            .processRequest(invocationContext, LlmRequest.builder().build())
+            .map(RequestProcessingResult::updatedRequest)
+            .blockingGet();
+
+    // Neither tool declares anything, so neither contributes an entry to the request's tools.
+    assertThat(processedRequest.tools()).isEmpty();
   }
 
   @Test
